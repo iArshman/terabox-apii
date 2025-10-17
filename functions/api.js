@@ -1,5 +1,6 @@
-// TeraBox Download Links Extractor - SIMPLE VERSION
-// Just returns download links, nothing else!
+// === TeraBox Download Extractor + Auto Proxy (Cloudflare Worker) ===
+// Author: Rex + GPT
+// Purpose: Extract TeraBox download links and auto-proxy big files through Cloudflare
 
 const COOKIES = {
   'PANWEB': '1',
@@ -21,57 +22,63 @@ export async function onRequest(context) {
   return handleRequest(context.request);
 }
 
+// === MAIN HANDLER ===
 async function handleRequest(request) {
-  // CORS
-  if (request.method === 'OPTIONS') {
-    return new Response(null, { headers: cors() });
+  if (request.method === "OPTIONS") return new Response(null, { headers: cors() });
+
+  const query = new URL(request.url).searchParams;
+
+  // Handle proxying mode
+  if (query.has("proxy")) {
+    return proxyDownload(request);
+  }
+
+  // Handle extraction mode
+  const url = query.get("url");
+  if (!url) {
+    return json({ error: "Add ?url=YOUR_TERABOX_LINK" }, 400);
   }
 
   try {
-    const url = new URL(request.url).searchParams.get("url");
-    
-    if (!url) {
-      return json({ error: "Add ?url=YOUR_TERABOX_LINK" }, 400);
-    }
+    // Build cookies
+    const cookies = Object.entries(COOKIES).map(([k, v]) => `${k}=${v}`).join("; ");
 
-    // Get cookies string
-    const cookies = Object.entries(COOKIES).map(([k, v]) => `${k}=${v}`).join('; ');
-
-    // Normalize URL
+    // Normalize mirror URL
     let mirrorUrl = url;
-    if (url.includes('/s/')) {
-      const surl = url.split('/s/')[1].split('?')[0];
+    if (url.includes("/s/")) {
+      const surl = url.split("/s/")[1].split("?")[0];
       mirrorUrl = `https://www.1024tera.com/s/${surl}`;
-    } else if (url.includes('surl=')) {
-      const surl = url.split('surl=')[1].split('&')[0];
+    } else if (url.includes("surl=")) {
+      const surl = url.split("surl=")[1].split("&")[0];
       mirrorUrl = `https://www.1024tera.com/sharing/link?surl=${surl}`;
     }
 
-    // Step 1: Fetch page
+    // Fetch the page
     const page = await fetch(mirrorUrl, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
         "Cookie": cookies
-      }
+      },
+      cf: { cacheTtl: 3600, cacheEverything: true }
     });
 
     const html = await page.text();
     const finalUrl = page.url;
 
-    // Step 2: Extract tokens
+    // Extract required tokens
     const jsToken = extract(html, 'fn%28%22', '%22%29');
     const logId = extract(html, 'dp-logid=', '&');
-    const surl = finalUrl.includes('surl=') 
+    const surl = finalUrl.includes('surl=')
       ? finalUrl.split('surl=')[1].split('&')[0]
       : finalUrl.split('/s/')[1]?.split('?')[0];
 
     if (!jsToken || !logId || !surl) {
-      return json({ error: "Failed to extract tokens. Cookies expired?" }, 403);
+      return json({ error: "Failed to extract tokens. Cookies might be expired." }, 403);
     }
 
-    // Step 3: Get file list
-    const api = `https://www.terabox.app/share/list?app_id=250528&web=1&channel=dubox&clienttype=0&jsToken=${jsToken}&dplogid=${logId}&page=1&num=20&shorturl=${surl}&root=1`;
-    
+    // Get file list
+    const api = `https://www.terabox.app/share/list?app_id=250528&web=1&channel=dubox&clienttype=0&jsToken=${jsToken}&dplogid=${logId}&page=1&num=100&shorturl=${surl}&root=1`;
+
     const res = await fetch(api, {
       headers: {
         "User-Agent": "Mozilla/5.0",
@@ -94,30 +101,68 @@ async function handleRequest(request) {
 
     // Handle directory
     if (files[0]?.isdir === "1") {
-      const dirApi = `https://www.terabox.app/share/list?app_id=250528&web=1&channel=dubox&clienttype=0&jsToken=${jsToken}&dplogid=${logId}&page=1&num=20&shorturl=${surl}&dir=${files[0].path}&by=name&order=asc`;
-      
-      const dirRes = await fetch(dirApi, {
-        headers: { "Cookie": cookies, "Referer": finalUrl }
-      });
-      
+      const dirApi = `https://www.terabox.app/share/list?app_id=250528&web=1&channel=dubox&clienttype=0&jsToken=${jsToken}&dplogid=${logId}&page=1&num=100&shorturl=${surl}&dir=${files[0].path}&by=name&order=asc`;
+      const dirRes = await fetch(dirApi, { headers: { "Cookie": cookies, "Referer": finalUrl } });
       const dirData = await dirRes.json();
       if (dirData.list?.length) files = dirData.list;
     }
 
-    // Return ONLY download links
-const links = files.map(f => ({
-  name: f.server_filename,
-  download_url: f.dlink
-}));
+    // Build result list
+    const origin = new URL(request.url).origin;
 
-return json({ links });
+    const links = files.map(f => {
+      const sizeMB = f.size ? f.size / (1024 * 1024) : 0;
+      const autoProxy = sizeMB >= 100;
+      const proxyUrl = `${origin}?proxy=${encodeURIComponent(f.dlink)}`;
+      return {
+        name: f.server_filename,
+        size_mb: Math.round(sizeMB * 100) / 100,
+        original_url: f.dlink,
+        download_url: autoProxy ? proxyUrl : f.dlink,
+        proxied: autoProxy
+      };
+    });
+
+    return json({ count: links.length, links });
 
   } catch (err) {
     return json({ error: err.message }, 500);
   }
 }
 
-// Helpers
+// === PROXY HANDLER ===
+async function proxyDownload(request) {
+  const dlink = new URL(request.url).searchParams.get("proxy");
+
+  if (!dlink) {
+    return json({ error: "Missing ?proxy=<download_link>" }, 400);
+  }
+
+  const cookies = Object.entries(COOKIES).map(([k, v]) => `${k}=${v}`).join("; ");
+
+  // Stream the file through Cloudflare edge
+  const res = await fetch(dlink, {
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      "Cookie": cookies
+    },
+    cf: { cacheTtl: 3600, cacheEverything: true }
+  });
+
+  if (!res.ok) {
+    return json({ error: `Proxy fetch failed (${res.status})` }, res.status);
+  }
+
+  return new Response(res.body, {
+    headers: {
+      "Content-Type": res.headers.get("Content-Type") || "application/octet-stream",
+      "Content-Disposition": res.headers.get("Content-Disposition") || "attachment",
+      "Access-Control-Allow-Origin": "*"
+    }
+  });
+}
+
+// === HELPERS ===
 function extract(str, start, end) {
   const s = str.indexOf(start);
   if (s === -1) return null;
