@@ -105,12 +105,12 @@ async function handleRequest(request) {
     }
 
     // Return ONLY download links
-    const links = files.map(f => ({
-      name: f.server_filename,
-      link: f.dlink
-    }));
+const links = files.map(f => ({
+  name: f.server_filename,
+  download_url: f.dlink
+}));
 
-    return json({ links });
+return json({ links });
 
   } catch (err) {
     return json({ error: err.message }, 500);
