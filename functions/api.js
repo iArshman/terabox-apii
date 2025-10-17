@@ -1,7 +1,3 @@
-// === TeraBox Download Extractor + Auto Proxy (Cloudflare Worker) ===
-// Author: Rex + GPT
-// Purpose: Extract TeraBox download links and auto-proxy big files through Cloudflare
-
 const COOKIES = {
   'PANWEB': '1',
   '__bid_n': '199f06ecf83c6517974207',
@@ -14,155 +10,161 @@ const COOKIES = {
 
 export default {
   async fetch(request) {
-    return handleRequest(request);
+    const { pathname, searchParams } = new URL(request.url);
+
+    // --- CORS ---
+    if (request.method === "OPTIONS") return new Response(null, { headers: cors() });
+
+    // --- Proxy route ---
+    if (pathname.startsWith("/proxy")) {
+      const u = searchParams.get("u");
+      if (!u) return new Response("Missing ?u=", { status: 400 });
+
+      const origin = await fetch(u, { headers: { range: request.headers.get("range") || "" } });
+      return new Response(origin.body, { status: origin.status, headers: origin.headers });
+    }
+
+    // --- Update route ---
+    if (pathname === "/update") {
+      if (request.method === "GET") return updateForm();
+      if (request.method === "POST") return handleUpdate(request);
+    }
+
+    // --- Default (extractor) route ---
+    return handleExtract(request);
   }
 };
 
-export async function onRequest(context) {
-  return handleRequest(context.request);
-}
-
-// === MAIN HANDLER ===
-async function handleRequest(request) {
-  if (request.method === "OPTIONS") return new Response(null, { headers: cors() });
-
-  const query = new URL(request.url).searchParams;
-
-  // Handle proxying mode
-  if (query.has("proxy")) {
-    return proxyDownload(request);
-  }
-
-  // Handle extraction mode
-  const url = query.get("url");
-  if (!url) {
-    return json({ error: "Add ?url=YOUR_TERABOX_LINK" }, 400);
-  }
+// --- Update Handler (JSON or Form) ---
+async function handleUpdate(request) {
+  const contentType = request.headers.get("content-type") || "";
 
   try {
-    // Build cookies
-    const cookies = Object.entries(COOKIES).map(([k, v]) => `${k}=${v}`).join("; ");
-
-    // Normalize mirror URL
-    let mirrorUrl = url;
-    if (url.includes("/s/")) {
-      const surl = url.split("/s/")[1].split("?")[0];
-      mirrorUrl = `https://www.1024tera.com/s/${surl}`;
-    } else if (url.includes("surl=")) {
-      const surl = url.split("surl=")[1].split("&")[0];
-      mirrorUrl = `https://www.1024tera.com/sharing/link?surl=${surl}`;
-    }
-
-    // Fetch the page
-    const page = await fetch(mirrorUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
-        "Cookie": cookies
-      },
-      cf: { cacheTtl: 3600, cacheEverything: true }
-    });
-
-    const html = await page.text();
-    const finalUrl = page.url;
-
-    // Extract required tokens
-    const jsToken = extract(html, 'fn%28%22', '%22%29');
-    const logId = extract(html, 'dp-logid=', '&');
-    const surl = finalUrl.includes('surl=')
-      ? finalUrl.split('surl=')[1].split('&')[0]
-      : finalUrl.split('/s/')[1]?.split('?')[0];
-
-    if (!jsToken || !logId || !surl) {
-      return json({ error: "Failed to extract tokens. Cookies might be expired." }, 403);
-    }
-
-    // Get file list
-    const api = `https://www.terabox.app/share/list?app_id=250528&web=1&channel=dubox&clienttype=0&jsToken=${jsToken}&dplogid=${logId}&page=1&num=100&shorturl=${surl}&root=1`;
-
-    const res = await fetch(api, {
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-        "Cookie": cookies,
-        "Referer": finalUrl
+    if (contentType.includes("application/json")) {
+      const body = await request.json();
+      Object.assign(COOKIES, body);
+    } else if (contentType.includes("application/x-www-form-urlencoded")) {
+      const form = await request.formData();
+      for (const key of Object.keys(COOKIES)) {
+        if (form.get(key)) COOKIES[key] = form.get(key);
       }
-    });
-
-    const data = await res.json();
-
-    if (data.errno !== 0) {
-      return json({ error: data.errmsg || "API error", errno: data.errno }, 400);
     }
 
-    if (!data.list?.length) {
-      return json({ error: "No files found" }, 404);
-    }
-
-    let files = data.list;
-
-    // Handle directory
-    if (files[0]?.isdir === "1") {
-      const dirApi = `https://www.terabox.app/share/list?app_id=250528&web=1&channel=dubox&clienttype=0&jsToken=${jsToken}&dplogid=${logId}&page=1&num=100&shorturl=${surl}&dir=${files[0].path}&by=name&order=asc`;
-      const dirRes = await fetch(dirApi, { headers: { "Cookie": cookies, "Referer": finalUrl } });
-      const dirData = await dirRes.json();
-      if (dirData.list?.length) files = dirData.list;
-    }
-
-    // Build result list
-    const origin = new URL(request.url).origin;
-
-    const links = files.map(f => {
-      const sizeMB = f.size ? f.size / (1024 * 1024) : 0;
-      const autoProxy = sizeMB >= 100;
-      const proxyUrl = `${origin}?proxy=${encodeURIComponent(f.dlink)}`;
-      return {
-        name: f.server_filename,
-        size_mb: Math.round(sizeMB * 100) / 100,
-        original_url: f.dlink,
-        download_url: autoProxy ? proxyUrl : f.dlink,
-        proxied: autoProxy
-      };
-    });
-
-    return json({ count: links.length, links });
-
-  } catch (err) {
-    return json({ error: err.message }, 500);
+    COOKIES.updatedAt = new Date().toISOString();
+    return json({ success: true, cookies: COOKIES });
+  } catch (e) {
+    return json({ error: "Invalid update data", details: e.message }, 400);
   }
 }
 
-// === PROXY HANDLER ===
-async function proxyDownload(request) {
-  const dlink = new URL(request.url).searchParams.get("proxy");
+// --- HTML Form for Cookie Update ---
+function updateForm() {
+  const formHtml = `
+  <!DOCTYPE html>
+  <html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Update TeraBox Cookies</title>
+    <style>
+      body { font-family: sans-serif; background: #0d1117; color: #fff; padding: 2rem; }
+      form { background: #161b22; padding: 2rem; border-radius: 1rem; max-width: 500px; margin: auto; }
+      label { display: block; margin-top: 1rem; font-weight: bold; }
+      input[type=text] { width: 100%; padding: 0.6rem; border: none; border-radius: 0.5rem; background: #21262d; color: #fff; }
+      button { margin-top: 1.5rem; padding: 0.7rem 1.5rem; background: #238636; color: #fff; border: none; border-radius: 0.5rem; cursor: pointer; }
+      button:hover { background: #2ea043; }
+      .footer { text-align: center; margin-top: 2rem; font-size: 0.9em; color: #aaa; }
+    </style>
+  </head>
+  <body>
+    <form method="POST">
+      <h2>🧠 Update TeraBox Cookies</h2>
+      ${Object.keys(COOKIES)
+        .map(
+          key => `
+        <label for="${key}">${key}</label>
+        <input type="text" id="${key}" name="${key}" value="${COOKIES[key] || ""}" />
+      `
+        )
+        .join("")}
+      <button type="submit">Update Cookies</button>
+      <div class="footer">Current update: ${COOKIES.updatedAt || "Never"}</div>
+    </form>
+  </body>
+  </html>
+  `;
+  return new Response(formHtml, { headers: { "Content-Type": "text/html" } });
+}
 
-  if (!dlink) {
-    return json({ error: "Missing ?proxy=<download_link>" }, 400);
-  }
+// --- Extractor Handler ---
+async function handleExtract(request) {
+  const url = new URL(request.url).searchParams.get("url");
+  if (!url) return json({ error: "Add ?url=YOUR_TERABOX_LINK" }, 400);
 
   const cookies = Object.entries(COOKIES).map(([k, v]) => `${k}=${v}`).join("; ");
 
-  // Stream the file through Cloudflare edge
-  const res = await fetch(dlink, {
-    headers: {
-      "User-Agent": "Mozilla/5.0",
-      "Cookie": cookies
-    },
-    cf: { cacheTtl: 3600, cacheEverything: true }
-  });
-
-  if (!res.ok) {
-    return json({ error: `Proxy fetch failed (${res.status})` }, res.status);
+  // Normalize link
+  let mirrorUrl = url;
+  if (url.includes("/s/")) {
+    const surl = url.split("/s/")[1].split("?")[0];
+    mirrorUrl = `https://www.1024tera.com/s/${surl}`;
+  } else if (url.includes("surl=")) {
+    const surl = url.split("surl=")[1].split("&")[0];
+    mirrorUrl = `https://www.1024tera.com/sharing/link?surl=${surl}`;
   }
 
-  return new Response(res.body, {
-    headers: {
-      "Content-Type": res.headers.get("Content-Type") || "application/octet-stream",
-      "Content-Disposition": res.headers.get("Content-Disposition") || "attachment",
-      "Access-Control-Allow-Origin": "*"
-    }
+  // Step 1: Fetch page
+  const page = await fetch(mirrorUrl, {
+    headers: { "User-Agent": "Mozilla/5.0", "Cookie": cookies }
   });
+
+  const html = await page.text();
+  const finalUrl = page.url;
+
+  // Step 2: Extract tokens
+  const jsToken = extract(html, 'fn%28%22', '%22%29');
+  const logId = extract(html, 'dp-logid=', '&');
+  const surl = finalUrl.includes('surl=')
+    ? finalUrl.split('surl=')[1].split('&')[0]
+    : finalUrl.split('/s/')[1]?.split('?')[0];
+
+  if (!jsToken || !logId || !surl)
+    return json({ error: "Failed to extract tokens. Cookies expired?" }, 403);
+
+  // Step 3: Get file list
+  const api = `https://www.terabox.app/share/list?app_id=250528&web=1&channel=dubox&clienttype=0&jsToken=${jsToken}&dplogid=${logId}&page=1&num=20&shorturl=${surl}&root=1`;
+  const res = await fetch(api, { headers: { "User-Agent": "Mozilla/5.0", "Cookie": cookies } });
+  const data = await res.json();
+
+  if (data.errno !== 0) return json({ error: data.errmsg || "API error" }, 400);
+  if (!data.list?.length) return json({ error: "No files found" }, 404);
+
+  // Handle directory
+  let files = data.list;
+  if (files[0]?.isdir === "1") {
+    const dirApi = `https://www.terabox.app/share/list?app_id=250528&web=1&channel=dubox&clienttype=0&jsToken=${jsToken}&dplogid=${logId}&page=1&num=20&shorturl=${surl}&dir=${files[0].path}`;
+    const dirRes = await fetch(dirApi, { headers: { "Cookie": cookies } });
+    const dirData = await dirRes.json();
+    if (dirData.list?.length) files = dirData.list;
+  }
+
+  // Build final links
+  const workerOrigin = new URL(request.url).origin;
+  const links = files.map(f => {
+    const sizeMB = +(f.size / 1024 / 1024).toFixed(2);
+    const proxyUrl = `${workerOrigin}/proxy?u=${encodeURIComponent(f.dlink)}`;
+    return {
+      name: f.server_filename,
+      size_mb: sizeMB,
+      original_url: f.dlink,
+      download_url: proxyUrl,
+      proxied: true
+    };
+  });
+
+  return json({ count: links.length, links });
 }
 
-// === HELPERS ===
+// --- Helpers ---
 function extract(str, start, end) {
   const s = str.indexOf(start);
   if (s === -1) return null;
@@ -180,7 +182,7 @@ function json(data, status = 200) {
 function cors() {
   return {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type"
   };
 }
